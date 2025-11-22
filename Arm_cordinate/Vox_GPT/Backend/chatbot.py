@@ -44,13 +44,11 @@ JOINTS = {
     "wrist": {"pin": "D8", "min_angle": 0, "max_angle": 180, "current_angle": 90},
     "gripper": {"pin": "D0", "open_angle": 0, "closed_angle": 120, "current_state": "open"}
 }
-# New state for home and repeat functionality
 HOME_POSITION_ANGLES = {"base": 0, "shoulder": 70, "elbow": 160, "wrist": 120}
-
 LAST_COORDINATE = None
 IS_REPEATING = False
 
-# === INVERSE KINEMATICS ===
+# === KINEMATICS ===
 def calculate_inverse_kinematics(x, y, z):
     try:
         base_angle_rad = math.atan2(y, x)
@@ -80,34 +78,27 @@ def calculate_inverse_kinematics(x, y, z):
 
 # === BACKGROUND REPEAT THREAD ===
 def _repeat_movement_thread():
-    """Function to run in a background thread for repeating movements."""
     global IS_REPEATING, LAST_COORDINATE, HOME_POSITION_ANGLES
     print("Repeat thread started.")
     while IS_REPEATING:
-        if not LAST_COORDINATE:
-            IS_REPEATING = False; break
-        if not IS_REPEATING: break
-        # Go to Home and open gripper
+        if not LAST_COORDINATE or not IS_REPEATING: break
         home_payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES, "gripper": "open"}
         send_command_to_esp32(home_payload)
         time.sleep(10)
         if not IS_REPEATING: break
-        # Go to last coordinate
         angles = calculate_inverse_kinematics(LAST_COORDINATE['x'], LAST_COORDINATE['y'], LAST_COORDINATE['z'])
         if "error" not in angles:
-            payload = {"command": "SET_ANGLES", **angles}
-            send_command_to_esp32(payload)
+            send_command_to_esp32({"command": "SET_ANGLES", **angles})
             time.sleep(10)
         else:
-            IS_REPEATING = False; break
+            IS_REPEATING = False
     print("Repeat thread finished.")
 
 # === CAMERA HELPERS ===
 def capture_frame():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened(): return None
-    ret, frame = cap.read()
-    cap.release()
+    ret, frame = cap.read(); cap.release()
     return frame if ret else None
 
 def encode_frame_to_base64(frame):
@@ -139,6 +130,16 @@ def parse_angle_command(user_input):
         return {"joint": match.group(1).lower(), "value": int(match.group(2))}
     return None
 
+def parse_jog_command(user_input):
+    """Parses 'jog [axis] by [value]' commands."""
+    pattern = r"(?:jog|move|nudge)\s+(x|y|z)\s+by\s+(-?\d+(?:\.\d+)?)"
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        axis = match.group(1).lower()
+        value = float(match.group(2))
+        return {"axis": axis, "value": value}
+    return None
+
 # === ESP32 COMMUNICATION ===
 def send_command_to_esp32(payload):
     try:
@@ -154,6 +155,8 @@ def send_command_to_esp32(payload):
 def handle_help_request():
     examples = [
         "move arm to x=20, y=0, z=25, g open",
+        "jog x by 5",
+        "move y by -10",
         "move base to 45 degrees",
         "move to home",
         "repeat",
@@ -174,6 +177,7 @@ def chat():
     user_lower = user_message.lower()
     result = None
 
+    # --- Command Processing Order ---
     if 'stop' in user_lower or 'emergency' in user_lower:
         if IS_REPEATING:
             IS_REPEATING = False
@@ -183,8 +187,6 @@ def chat():
     elif 'home' in user_lower:
         payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES, "gripper": "open"}
         result = send_command_to_esp32(payload)
-        if result['status'] == 'success':
-            result['message'] = "Moving to home position (gripper open)."
     elif 'repeat' in user_lower:
         if LAST_COORDINATE is None:
             result = {"status": "error", "message": "No last coordinate to repeat."}
@@ -197,6 +199,7 @@ def chat():
     else:
         move_to_cmd = parse_move_to_command(user_message)
         angle_cmd = parse_angle_command(user_message)
+        jog_cmd = parse_jog_command(user_message)
 
         if move_to_cmd:
             coords = move_to_cmd["coords"]
@@ -210,9 +213,21 @@ def chat():
                 if gripper_state:
                     payload["gripper"] = gripper_state.lower()
                 result = send_command_to_esp32(payload)
-                if result["status"] == "success":
-                    message = f"Moving to {coords}" + (f" and setting gripper to {gripper_state.lower()}" if gripper_state else "")
-                    result["message"] = message
+        
+        elif jog_cmd:
+            if LAST_COORDINATE is None:
+                result = {"status": "error", "message": "Cannot jog. Please move to an absolute position first."}
+            else:
+                new_coords = LAST_COORDINATE.copy()
+                new_coords[jog_cmd["axis"]] += jog_cmd["value"]
+                angles = calculate_inverse_kinematics(new_coords["x"], new_coords["y"], new_coords["z"])
+                if "error" in angles:
+                    result = {"status": "error", "message": f"Jog move is unreachable: {angles['error']}"}
+                else:
+                    LAST_COORDINATE = new_coords
+                    payload = {"command": "SET_ANGLES", **angles}
+                    result = send_command_to_esp32(payload)
+
         elif angle_cmd:
             joint, target_angle = angle_cmd["joint"], angle_cmd["value"]
             current_angles = { "base": JOINTS["base"]["current_angle"], "shoulder": JOINTS["shoulder"]["current_angle"], "elbow": JOINTS["elbow"]["current_angle"], "wrist": JOINTS["wrist"]["current_angle"] }
@@ -221,22 +236,28 @@ def chat():
             if not (min_a <= target_angle <= max_a):
                 result = {"status": "error", "message": f"For {joint}, angle must be between {min_a} and {max_a}°."}
             else:
-                # Logic to handle single joint moves needs to include wrist now
-                payload = {"command": "SET_ANGLES", "base": current_angles["base"], "shoulder": current_angles["shoulder"], "elbow": current_angles["elbow"], "wrist": current_angles["wrist"]}
+                payload = {"command": "SET_ANGLES", **current_angles}
                 result = send_command_to_esp32(payload)
 
         elif "frame" in user_lower and "see" in user_lower:
             frame = capture_frame()
             if frame is None: return jsonify({"response": "Camera not available."} ), 500
             return jsonify({"response": analyze_frame_with_gemini(frame, user_message), "image": encode_frame_to_base64(frame)})
+        
         elif 'gripper' in user_lower:
             result = send_command_to_esp32({"command": "GRIPPER_TOGGLE"})
+        
         elif 'help' in user_lower:
             result = handle_help_request()
+        
         elif handle_greeting(user_message):
              result = handle_greeting(user_message)
+        
         else:
             result = handle_help_request()
+
+    if result and result.get("status") == "success" and not result.get("message"):
+        result["message"] = "Done."
 
     prefix = "✅ " if result.get("status") == "success" else "❌ " if result.get("status") == "error" else "ℹ️ "
     return jsonify({"response": prefix + result.get("message", "An unknown error occurred.")})
@@ -252,5 +273,5 @@ def telemetry():
         return jsonify({"error": "ESP32 unreachable"}), 500
 
 if __name__ == '__main__':
-    print("Starting Flask server with Gripper Control support...")
+    print("Starting Flask server with Jogging support...")
     app.run(host='0.0.0.0', port=5000, debug=True)
