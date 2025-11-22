@@ -28,6 +28,7 @@ int targetBaseAngle = 90;
 int targetShoulderAngle = 90;
 int targetElbowAngle = 90;
 int targetWristAngle = 90;
+int targetGripperAngle = 120; // 0 for closed, 120 for open
 
 // State for the gripper
 bool gripperState = false; // false = Open, true = Closed
@@ -53,7 +54,7 @@ void setup() {
   shoulderServo.write(targetShoulderAngle);
   elbowServo.write(targetElbowAngle);
   wristServo.write(targetWristAngle);
-  gripperServo.write(gripperState ? 120 : 0);
+  gripperServo.write(targetGripperAngle); // Initialize gripper with target
 
   // Connect to WiFi
   WiFi.mode(WIFI_STA);
@@ -108,6 +109,13 @@ void loop() {
       wristServo.write(currentWrist + step);
       return;
     }
+
+    int currentGripper = gripperServo.read();
+    if (currentGripper != targetGripperAngle) {
+      int step = (targetGripperAngle > currentGripper) ? 1 : -1;
+      gripperServo.write(currentGripper + step);
+      return;
+    }
   }
 }
 
@@ -128,43 +136,55 @@ void handleCommand() {
   String command = doc["command"].as<String>();
 
   if (command == "SET_ANGLES") {
-    if (doc.containsKey("base") && doc.containsKey("shoulder") && doc.containsKey("elbow")) {
-      // Update the target angles. The main loop() will handle the movement.
+    // Update the target angles. The main loop() will handle the movement.
+    if (doc.containsKey("base")) {
       targetBaseAngle = constrain(doc["base"].as<int>(), 0, 180);
-      targetShoulderAngle = constrain(doc["shoulder"].as<int>(), 0, 170);
-      targetElbowAngle = constrain(doc["elbow"].as<int>(), 0, 170);
-
-      // Handle optional wrist angle
-      if (doc.containsKey("wrist")) {
-        targetWristAngle = constrain(doc["wrist"].as<int>(), 0, 180);
-      }
-      
-      // Handle optional gripper command
-      if (doc.containsKey("gripper")) {
-        String gripperCmd = doc["gripper"];
-        if (gripperCmd == "open") {
-          gripperServo.write(0);
-          gripperState = false;
-        } else if (gripperCmd == "close") {
-          gripperServo.write(120);
-          gripperState = true;
-        }
-      }
-      server.send(200, "application/json", "{\"status\":\"Movement initiated\"}");
-    } else {
-      server.send(400, "application/json", "{\"status\":\"Missing angle parameters\"}");
     }
+    if (doc.containsKey("shoulder")) {
+      targetShoulderAngle = constrain(doc["shoulder"].as<int>(), 0, 170);
+    }
+    if (doc.containsKey("elbow")) {
+      targetElbowAngle = constrain(doc["elbow"].as<int>(), 0, 170);
+    }
+    if (doc.containsKey("wrist")) {
+      targetWristAngle = constrain(doc["wrist"].as<int>(), 0, 180);
+    }
+    
+    // Handle optional gripper command
+    if (doc.containsKey("gripper")) {
+      String gripperCmd = doc["gripper"];
+      if (gripperCmd == "close") {
+        targetGripperAngle = 0;
+        gripperState = true;
+      } else if (gripperCmd == "open") {
+        targetGripperAngle = 120;
+        gripperState = false;
+      }
+    }
+    server.send(200, "application/json", "{\"status\":\"Movement initiated\"}");
   } else if (command == "GRIPPER_TOGGLE") {
-    gripperState = !gripperState;
-    gripperServo.write(gripperState ? 120 : 0);
-    server.send(200, "application/json", "{\"status\":\"Gripper toggled\"}");
+    // This command is now primarily for toggling, but can also be used for explicit open/close
+    if (doc.containsKey("gripper")) {
+      String gripperCmd = doc["gripper"];
+      if (gripperCmd == "close") {
+        targetGripperAngle = 0;
+        gripperState = true;
+      } else if (gripperCmd == "open") {
+        targetGripperAngle = 120;
+        gripperState = false;
+      }
+    } else { // Toggle if no explicit state is given
+      gripperState = !gripperState;
+      targetGripperAngle = gripperState ? 120 : 0;
+    }
+    server.send(200, "application/json", "{\"status\":\"Gripper movement initiated\"}");
   } else if (command == "EMERGENCY_STOP") {
     // Set targets to home position
     targetBaseAngle = 90;
     targetShoulderAngle = 90;
     targetElbowAngle = 90;
     targetWristAngle = 90;
-    gripperServo.write(0); // Open gripper
+    targetGripperAngle = 120; // Open gripper
     gripperState = false;
     server.send(200, "application/json", "{\"status\":\"Stop initiated\"}");
   } else {
