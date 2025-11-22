@@ -45,8 +45,12 @@ JOINTS = {
     "gripper": {"pin": "D0", "open_angle": 120, "closed_angle": 0, "current_state": "open"}
 }
 HOME_POSITION_ANGLES = {"base": 10, "shoulder": 70, "elbow": 160, "wrist": 120}
-LAST_COORDINATE = None
+LAST_COMMAND_DETAILS = None
 IS_REPEATING = False
+
+# Global variables for saved poses
+saved_poses = {}
+next_pose_id = 1
 
 # === KINEMATICS ===
 def calculate_inverse_kinematics(x, y, z):
@@ -78,28 +82,25 @@ def calculate_inverse_kinematics(x, y, z):
 
 # === BACKGROUND REPEAT THREAD ===
 def _repeat_movement_thread():
-    global IS_REPEATING, LAST_COORDINATE, HOME_POSITION_ANGLES
+    global IS_REPEATING, LAST_COMMAND_DETAILS, HOME_POSITION_ANGLES
     print("Repeat thread started.")
     while IS_REPEATING:
-        if not LAST_COORDINATE or not IS_REPEATING: break
+        if not LAST_COMMAND_DETAILS or not IS_REPEATING: break
         
-        # --- Go to Home Position and Close Gripper ---
+        # Extract coordinates from LAST_COMMAND_DETAILS
+        coords = LAST_COMMAND_DETAILS['coords']
+
+        # --- Go to Home Position ---
         home_angles_payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES}
         send_command_to_esp32(home_angles_payload)
-        time.sleep(1) # Wait for arm to reach home position (1 second)
+        time.sleep(3) # Wait for arm to reach home position (3 seconds)
         if not IS_REPEATING: break
-        send_command_to_esp32({"command": "GRIPPER_TOGGLE", "gripper": "close"}) # Explicitly close gripper
-        time.sleep(1) # Wait for gripper to close (1 second)
 
-        # --- Go to Last Coordinate and Open Gripper ---
-        if not IS_REPEATING: break
-        angles = calculate_inverse_kinematics(LAST_COORDINATE['x'], LAST_COORDINATE['y'], LAST_COORDINATE['z'])
+        # --- Go to Last Coordinate ---
+        angles = calculate_inverse_kinematics(coords['x'], coords['y'], coords['z'])
         if "error" not in angles:
             send_command_to_esp32({"command": "SET_ANGLES", **angles})
             time.sleep(1) # Wait for arm to reach target position (1 second)
-            if not IS_REPEATING: break
-            send_command_to_esp32({"command": "GRIPPER_TOGGLE", "gripper": "open"}) # Explicitly open gripper
-            time.sleep(1) # Wait for gripper to open (1 second)
         else:
             print(f"Error reaching last coordinate in repeat: {angles['error']}")
             IS_REPEATING = False
@@ -126,7 +127,7 @@ def analyze_frame_with_gemini(frame, user_query):
     except Exception as e:
         return f"Vision analysis unavailable. Error: {str(e)[:100]}..."
 
-# === ROBOTIC ARM PARSERS ===
+# === ROBOT ARM PARSERS ===
 def parse_move_to_command(user_input):
     pattern = r"move\s+(?:arm\s+to\s+)?x\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*z\s*=\s*(-?\d+(?:\.\d+)?)\s*(?:(?:,|\s)\s*(?:g|gripper)\s+(open|close))?"
     match = re.search(pattern, user_input, re.IGNORECASE)
@@ -203,7 +204,7 @@ def handle_greeting(user_input):
 # === ROUTES ===
 @app.route('/chat', methods=['POST'])
 def chat():
-    global LAST_COORDINATE, IS_REPEATING
+    global IS_REPEATING, LAST_COMMAND_DETAILS, saved_poses, next_pose_id, saved_poses, next_pose_id
     data = request.get_json()
     user_message = data.get('message', '').strip()
     if not user_message:
@@ -223,14 +224,50 @@ def chat():
         payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES, "gripper": "open"}
         result = send_command_to_esp32(payload)
     elif 'repeat' in user_lower:
-        if LAST_COORDINATE is None:
-            result = {"status": "error", "message": "No last coordinate to repeat."}
+        if LAST_COMMAND_DETAILS is None:
+            result = {"status": "error", "message": "No last command to repeat."}
         elif IS_REPEATING:
             result = {"status": "info", "message": "Already in repeat mode."}
         else:
             IS_REPEATING = True
             threading.Thread(target=_repeat_movement_thread, daemon=True).start()
             result = {"status": "success", "message": "Starting repeat cycle. Say 'stop' to end."}
+    elif user_lower == "save":
+        if LAST_COMMAND_DETAILS and LAST_COMMAND_DETAILS.get("type") == "move_to":
+            pose_id = next_pose_id
+            saved_poses[pose_id] = LAST_COMMAND_DETAILS.copy()
+            next_pose_id += 1
+            result = {"status": "success", "message": f"Pose saved with ID: {pose_id}"}
+        else:
+            result = {"status": "error", "message": "No arm position to save. Please move the arm to a specific coordinate first."}
+    elif user_lower.startswith("move to id"):
+        try:
+            parts = user_lower.split()
+            pose_id = int(parts[3])
+            if pose_id in saved_poses:
+                saved_pose = saved_poses[pose_id]
+                coords = saved_pose["coords"]
+                gripper_state_from_saved_pose = saved_pose.get("gripper_state")
+
+                angles = calculate_inverse_kinematics(coords["x"], coords["y"], coords["z"])
+                if "error" in angles:
+                    result = {"status": "error", "message": angles["error"]}
+                else:
+                    LAST_COMMAND_DETAILS = saved_pose # Update LAST_COMMAND_DETAILS
+                    payload = {"command": "SET_ANGLES", **angles}
+                    result = send_command_to_esp32(payload) # Send angle command first
+
+                    if result.get("status") == "success" and gripper_state_from_saved_pose:
+                        time.sleep(1) # Wait for 1 second after angle movement
+                        gripper_payload = {"command": "GRIPPER_TOGGLE", "gripper": gripper_state_from_saved_pose}
+                        result = send_command_to_esp32(gripper_payload) # Then send gripper command
+                    
+                    if result.get("status") == "success":
+                        result["message"] = f"Moving arm to saved pose ID {pose_id} (X={coords['x']}, Y={coords['y']}, Z={coords['z']}, Gripper={gripper_state_from_saved_pose or 'unchanged'})."
+            else:
+                result = {"status": "error", "message": f"Pose with ID {pose_id} not found."}
+        except (IndexError, ValueError):
+            result = {"status": "error", "message": "Invalid 'move to id' command format. Please use: move to id X"}
     else:
         move_to_cmd = parse_move_to_command(user_message)
         angle_cmd = parse_angle_command(user_message)
@@ -242,7 +279,7 @@ def chat():
             if "error" in angles:
                 result = {"status": "error", "message": angles["error"]}
             else:
-                LAST_COORDINATE = coords
+                LAST_COMMAND_DETAILS = move_to_cmd
                 payload = {"command": "SET_ANGLES", **angles}
                 gripper_state_from_cmd = move_to_cmd.get("gripper_state")
                 gripper_state_to_send = None
@@ -257,16 +294,19 @@ def chat():
                     result = send_command_to_esp32(gripper_payload) # Then send gripper command
         
         elif jog_cmd:
-            if LAST_COORDINATE is None:
+            if LAST_COMMAND_DETAILS is None:
                 result = {"status": "error", "message": "Cannot jog. Please move to an absolute position first."}
             else:
-                new_coords = LAST_COORDINATE.copy()
+                # Extract coords from LAST_COMMAND_DETAILS
+                current_coords = LAST_COMMAND_DETAILS['coords'].copy()
+                new_coords = current_coords.copy()
                 new_coords[jog_cmd["axis"]] += jog_cmd["value"]
                 angles = calculate_inverse_kinematics(new_coords["x"], new_coords["y"], new_coords["z"])
                 if "error" in angles:
                     result = {"status": "error", "message": f"Jog move is unreachable: {angles['error']}"}
                 else:
-                    LAST_COORDINATE = new_coords
+                    # Update LAST_COMMAND_DETAILS with new coordinates
+                    LAST_COMMAND_DETAILS['coords'] = new_coords
                     payload = {"command": "SET_ANGLES", **angles}
                     result = send_command_to_esp32(payload)
 
@@ -276,7 +316,7 @@ def chat():
             # Create a payload with current angles for all joints, then update the commanded joint
             payload_angles = {}
             for j_name, j_data in JOINTS.items():
-                if j_name in ["base", "shoulder", "elbow", "wrist"]: # Only include controllable joints
+                if j_name in ["base", "shoulder", "elbow", "wrist"]:
                     payload_angles[j_name] = j_data["current_angle"]
             
             payload_angles[joint] = target_angle # Override the commanded joint's angle

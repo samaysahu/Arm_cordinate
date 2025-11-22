@@ -82,24 +82,26 @@ void loop() {
     lastMoveTime = millis();
 
     // Move servos one by one, only proceeding to the next if the current one is at its target
+    // Desired order: Elbow, Base, Shoulder, Wrist, Gripper
+
+    int currentElbow = elbowServo.read();
+    if (currentElbow != targetElbowAngle) {
+      int step = (targetElbowAngle > currentElbow) ? 1 : -1;
+      elbowServo.write(currentElbow + step);
+      return; // Process one servo move per loop iteration
+    }
+
     int currentBase = baseServo.read();
     if (currentBase != targetBaseAngle) {
       int step = (targetBaseAngle > currentBase) ? 1 : -1;
       baseServo.write(currentBase + step);
-      return; // Process one servo move per loop iteration
+      return;
     }
 
     int currentShoulder = shoulderServo.read();
     if (currentShoulder != targetShoulderAngle) {
       int step = (targetShoulderAngle > currentShoulder) ? 1 : -1;
       shoulderServo.write(currentShoulder + step);
-      return;
-    }
-
-    int currentElbow = elbowServo.read();
-    if (currentElbow != targetElbowAngle) {
-      int step = (targetElbowAngle > currentElbow) ? 1 : -1;
-      elbowServo.write(currentElbow + step);
       return;
     }
     
