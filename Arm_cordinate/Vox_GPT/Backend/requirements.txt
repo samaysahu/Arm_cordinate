@@ -1,0 +1,7 @@
+google-generativeai
+python-dotenv
+pyserial
+pynput
+opencv-python
+numpy
+Pillow

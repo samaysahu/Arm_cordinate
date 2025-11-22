@@ -1,0 +1,256 @@
+import threading
+import time
+import math
+from PIL import Image
+import numpy as np
+import cv2
+from dotenv import load_dotenv
+import json
+import os
+import re
+import google.generativeai as genai
+import requests
+from flask_cors import CORS
+from flask import Flask, request, jsonify
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+# === GEMINI CONFIG ===
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in .env file")
+
+genai.configure(api_key=GEMINI_API_KEY)
+text_model = genai.GenerativeModel('gemini-pro')
+vision_model = genai.GenerativeModel('gemini-pro-vision')
+
+# === ESP32 CONFIG ===
+ESP32_IP = "http://10.44.37.80"  # Change to your ESP32 IP
+
+# === ROBOT ARM DIMENSIONS (in cm) ===
+BASE_HEIGHT = 7.0
+HUMERUS_LENGTH = 19.0  # Shoulder to Elbow
+ULNA_LENGTH = 15.0     # Elbow to Wrist
+
+# === STATE VARIABLES ===
+JOINTS = {
+    "base": {"pin": "D4", "min_angle": 0, "max_angle": 180, "current_angle": 90},
+    "shoulder": {"pin": "D1", "min_angle": 0, "max_angle": 170, "current_angle": 90},
+    "elbow": {"pin": "D5", "min_angle": 0, "max_angle": 170, "current_angle": 90},
+    "wrist": {"pin": "D8", "min_angle": 0, "max_angle": 180, "current_angle": 90},
+    "gripper": {"pin": "D0", "open_angle": 0, "closed_angle": 120, "current_state": "open"}
+}
+# New state for home and repeat functionality
+HOME_POSITION_ANGLES = {"base": 0, "shoulder": 70, "elbow": 160, "wrist": 120}
+
+LAST_COORDINATE = None
+IS_REPEATING = False
+
+# === INVERSE KINEMATICS ===
+def calculate_inverse_kinematics(x, y, z):
+    try:
+        base_angle_rad = math.atan2(y, x)
+        base_angle_deg = int(math.degrees(base_angle_rad))
+        servo_base_angle = 90 - base_angle_deg
+        servo_base_angle = max(JOINTS["base"]["min_angle"], min(JOINTS["base"]["max_angle"], servo_base_angle))
+
+        r = math.sqrt(x**2 + y**2)
+        z_prime = z - BASE_HEIGHT
+        d = math.sqrt(r**2 + z_prime**2)
+
+        if d > (HUMERUS_LENGTH + ULNA_LENGTH) or d < abs(HUMERUS_LENGTH - ULNA_LENGTH):
+            return {"error": "Target is unreachable."}
+
+        alpha1 = math.acos((HUMERUS_LENGTH**2 + d**2 - ULNA_LENGTH**2) / (2 * HUMERUS_LENGTH * d))
+        alpha2 = math.atan2(z_prime, r)
+        servo_shoulder_angle = int(math.degrees(alpha1 + alpha2))
+        servo_shoulder_angle = max(JOINTS["shoulder"]["min_angle"], min(JOINTS["shoulder"]["max_angle"], servo_shoulder_angle))
+
+        beta = math.acos((HUMERUS_LENGTH**2 + ULNA_LENGTH**2 - d**2) / (2 * HUMERUS_LENGTH * ULNA_LENGTH))
+        servo_elbow_angle = 180 - int(math.degrees(math.pi - beta))
+        servo_elbow_angle = max(JOINTS["elbow"]["min_angle"], min(JOINTS["elbow"]["max_angle"], servo_elbow_angle))
+
+        return {"base": servo_base_angle, "shoulder": servo_shoulder_angle, "elbow": servo_elbow_angle}
+    except (ValueError, ZeroDivisionError):
+        return {"error": "Calculation error. The target might be out of the arm's work envelope."}
+
+# === BACKGROUND REPEAT THREAD ===
+def _repeat_movement_thread():
+    """Function to run in a background thread for repeating movements."""
+    global IS_REPEATING, LAST_COORDINATE, HOME_POSITION_ANGLES
+    print("Repeat thread started.")
+    while IS_REPEATING:
+        if not LAST_COORDINATE:
+            IS_REPEATING = False; break
+        if not IS_REPEATING: break
+        # Go to Home and open gripper
+        home_payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES, "gripper": "open"}
+        send_command_to_esp32(home_payload)
+        time.sleep(10)
+        if not IS_REPEATING: break
+        # Go to last coordinate
+        angles = calculate_inverse_kinematics(LAST_COORDINATE['x'], LAST_COORDINATE['y'], LAST_COORDINATE['z'])
+        if "error" not in angles:
+            payload = {"command": "SET_ANGLES", **angles}
+            send_command_to_esp32(payload)
+            time.sleep(10)
+        else:
+            IS_REPEATING = False; break
+    print("Repeat thread finished.")
+
+# === CAMERA HELPERS ===
+def capture_frame():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened(): return None
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+def encode_frame_to_base64(frame):
+    _, buffer = cv2.imencode('.jpg', frame)
+    return base64.b64encode(buffer).decode('utf-8')
+
+def analyze_frame_with_gemini(frame, user_query):
+    try:
+        image_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        response = vision_model.generate_content([f"Analyze this image: {user_query}", image_pil])
+        return response.text.strip()
+    except Exception as e:
+        return f"Vision analysis unavailable. Error: {str(e)[:100]}..."
+
+# === ROBOTIC ARM PARSERS ===
+def parse_move_to_command(user_input):
+    pattern = r"move\s+(?:arm\s+to\s+)?x\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*z\s*=\s*(-?\d+(?:\.\d+)?)\s*(?:(?:,|\s)\s*(?:g|gripper)\s+(open|close))?"
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        coords = {"x": float(match.group(1)), "y": float(match.group(2)), "z": float(match.group(3))}
+        gripper_state = match.group(4)
+        return {"type": "move_to", "coords": coords, "gripper_state": gripper_state}
+    return None
+
+def parse_angle_command(user_input):
+    pattern = r"move\s+(base|shoulder|elbow|wrist)\s+to\s+(\d+)\s*degrees?"
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        return {"joint": match.group(1).lower(), "value": int(match.group(2))}
+    return None
+
+# === ESP32 COMMUNICATION ===
+def send_command_to_esp32(payload):
+    try:
+        url = f"{ESP32_IP}/api/arm/command"
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code == 200:
+            return {"status": "success", "message": response.json().get("status", "Done")}
+        return {"status": "error", "message": f"ESP32 returned status {response.status_code}"}
+    except requests.RequestException as e:
+        return {"status": "error", "message": f"Cannot connect to ESP32: {e}"}
+
+# === HELP & GREETINGS ===
+def handle_help_request():
+    examples = [
+        "move arm to x=20, y=0, z=25, g open",
+        "move base to 45 degrees",
+        "move to home",
+        "repeat",
+        "stop",
+        "close gripper",
+    ]
+    return {"status": "success", "message": "You can try:\n" + "\n".join(f"• {ex}" for ex in examples)}
+
+# === ROUTES ===
+@app.route('/chat', methods=['POST'])
+def chat():
+    global LAST_COORDINATE, IS_REPEATING
+    data = request.get_json()
+    user_message = data.get('message', '').strip()
+    if not user_message:
+        return jsonify({"response": "Please send a message."} ), 400
+
+    user_lower = user_message.lower()
+    result = None
+
+    if 'stop' in user_lower or 'emergency' in user_lower:
+        if IS_REPEATING:
+            IS_REPEATING = False
+            result = {"status": "success", "message": "Repetition stopped."}
+        else:
+            result = send_command_to_esp32({"command": "EMERGENCY_STOP"})
+    elif 'home' in user_lower:
+        payload = {"command": "SET_ANGLES", **HOME_POSITION_ANGLES, "gripper": "open"}
+        result = send_command_to_esp32(payload)
+        if result['status'] == 'success':
+            result['message'] = "Moving to home position (gripper open)."
+    elif 'repeat' in user_lower:
+        if LAST_COORDINATE is None:
+            result = {"status": "error", "message": "No last coordinate to repeat."}
+        elif IS_REPEATING:
+            result = {"status": "info", "message": "Already in repeat mode."}
+        else:
+            IS_REPEATING = True
+            threading.Thread(target=_repeat_movement_thread, daemon=True).start()
+            result = {"status": "success", "message": "Starting repeat cycle. Say 'stop' to end."}
+    else:
+        move_to_cmd = parse_move_to_command(user_message)
+        angle_cmd = parse_angle_command(user_message)
+
+        if move_to_cmd:
+            coords = move_to_cmd["coords"]
+            angles = calculate_inverse_kinematics(coords["x"], coords["y"], coords["z"])
+            if "error" in angles:
+                result = {"status": "error", "message": angles["error"]}
+            else:
+                LAST_COORDINATE = coords
+                payload = {"command": "SET_ANGLES", **angles}
+                gripper_state = move_to_cmd.get("gripper_state")
+                if gripper_state:
+                    payload["gripper"] = gripper_state.lower()
+                result = send_command_to_esp32(payload)
+                if result["status"] == "success":
+                    message = f"Moving to {coords}" + (f" and setting gripper to {gripper_state.lower()}" if gripper_state else "")
+                    result["message"] = message
+        elif angle_cmd:
+            joint, target_angle = angle_cmd["joint"], angle_cmd["value"]
+            current_angles = { "base": JOINTS["base"]["current_angle"], "shoulder": JOINTS["shoulder"]["current_angle"], "elbow": JOINTS["elbow"]["current_angle"], "wrist": JOINTS["wrist"]["current_angle"] }
+            current_angles[joint] = target_angle
+            min_a, max_a = JOINTS[joint]["min_angle"], JOINTS[joint]["max_angle"]
+            if not (min_a <= target_angle <= max_a):
+                result = {"status": "error", "message": f"For {joint}, angle must be between {min_a} and {max_a}°."}
+            else:
+                # Logic to handle single joint moves needs to include wrist now
+                payload = {"command": "SET_ANGLES", "base": current_angles["base"], "shoulder": current_angles["shoulder"], "elbow": current_angles["elbow"], "wrist": current_angles["wrist"]}
+                result = send_command_to_esp32(payload)
+
+        elif "frame" in user_lower and "see" in user_lower:
+            frame = capture_frame()
+            if frame is None: return jsonify({"response": "Camera not available."} ), 500
+            return jsonify({"response": analyze_frame_with_gemini(frame, user_message), "image": encode_frame_to_base64(frame)})
+        elif 'gripper' in user_lower:
+            result = send_command_to_esp32({"command": "GRIPPER_TOGGLE"})
+        elif 'help' in user_lower:
+            result = handle_help_request()
+        elif handle_greeting(user_message):
+             result = handle_greeting(user_message)
+        else:
+            result = handle_help_request()
+
+    prefix = "✅ " if result.get("status") == "success" else "❌ " if result.get("status") == "error" else "ℹ️ "
+    return jsonify({"response": prefix + result.get("message", "An unknown error occurred.")})
+
+@app.route('/telemetry', methods=['GET'])
+def telemetry():
+    try:
+        resp = requests.get(f"{ESP32_IP}/api/arm/telemetry", timeout=3)
+        if resp.status_code == 200:
+            return jsonify(resp.json())
+        return jsonify({"error": "Failed to get telemetry"}), 500
+    except:
+        return jsonify({"error": "ESP32 unreachable"}), 500
+
+if __name__ == '__main__':
+    print("Starting Flask server with Gripper Control support...")
+    app.run(host='0.0.0.0', port=5000, debug=True)
